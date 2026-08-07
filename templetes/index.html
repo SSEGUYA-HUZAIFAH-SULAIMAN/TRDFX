@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Trading Dashboard</title>
+    <style>
+        body { font-family: Arial, sans-serif; background: #121212; color: #fff; text-align: center; padding: 20px; }
+        .card { background: #1e1e1e; border-radius: 10px; padding: 20px; max-width: 400px; margin: 0 auto; box-shadow: 0 4px 10px rgba(0,0,0,0.5); }
+        .buy { color: #00ff88; font-weight: bold; }
+        .wait { color: #ffaa00; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h2>🤖 AI Trading Signal</h2>
+        <p><strong>Last Updated:</strong> {{ data.time }}</p>
+        <hr>
+        <h1 class="{{ 'buy' if 'GO AHEAD' in data.status else 'wait' }}">{{ data.data_status if data.data_status else data.status }}</h1>
+        <p><strong>Model Confidence:</strong> {{ data.confidence }}</p>
+        <hr>
+        <h3>SMC Confluences</h3>
+        <p>Order Block: {{ '✅' if data.ob else '❌' }}</p>
+        <p>Fair Value Gap: {{ '✅' if data.fvg else '❌' }}</p>
+        <p>CHOCH Reversal: {{ '✅' if data.choch else '❌' }}</p>
+    </div>
+</body>
+</html>

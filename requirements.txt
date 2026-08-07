@@ -1,0 +1,8 @@
+flask
+gunicorn
+yfinance
+pandas
+numpy
+xgboost
+scikit-learn
+smartmoneyconcepts
