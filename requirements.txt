@@ -1,8 +1,8 @@
 flask
 gunicorn
-yfinance
 pandas
 numpy
 xgboost
-scikit-learn
+yfinance
 smartmoneyconcepts
+requests
