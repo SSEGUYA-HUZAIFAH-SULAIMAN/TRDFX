@@ -1,4 +1,5 @@
 import datetime
+import sys
 import traceback
 from flask import Flask, render_template_string
 import numpy as np
@@ -10,14 +11,13 @@ import yfinance as yf
 
 app = Flask(__name__)
 
-# Inline HTML template so no templates/ folder or index.html file is needed
 HTML_LAYOUT = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI Trading Signal Engine</title>
+    <title>AI Trading Engine</title>
     <style>
         body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #0d1117; color: #c9d1d9; text-align: center; padding: 20px; }
         .card { background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 25px; max-width: 450px; margin: 30px auto; box-shadow: 0 8px 24px rgba(0,0,0,0.5); }
@@ -52,7 +52,6 @@ HTML_LAYOUT = """
 
 
 def fetch_market_data():
-    """Fetches EUR/USD candles with session headers to bypass basic cloud blocks."""
     try:
         session = requests.Session()
         session.headers.update(
@@ -100,10 +99,11 @@ def run_pipeline():
             "fvg": False,
             "choch": False,
             "time": current_utc,
-            "error": f"Market data provider rate-limited by Yahoo. Details: {err}",
+            "error": f"Market data provider issue: {err}",
         }
 
     try:
+        # 1. Feature Engineering
         fvg_df = smc.fvg(df)
         df["fvg_signal"] = fvg_df["FVG"]
 
@@ -140,6 +140,7 @@ def run_pipeline():
         train_size = max(10, len(df) - 50)
         X_train, y_train = X.iloc[:train_size], df["target"].iloc[:train_size]
 
+        # 2. Train XGBoost
         model = XGBClassifier(
             n_estimators=50,
             learning_rate=0.03,
@@ -148,14 +149,20 @@ def run_pipeline():
         )
         model.fit(X_train, y_train)
 
-        latest_row = df.iloc[[-1]]
-        features = latest_row[feature_cols]
-        prediction = model.predict(features)[0]
-        confidence = float(model.predict_proba(features)[0][1])
+        # 3. Predict on Latest Candle
+        latest_row = df.iloc[[-1]][feature_cols]
+        prediction = model.predict(latest_row)[0]
 
-        has_fvg = latest_row["fvg_signal"].values[0] != 0
-        has_ob = latest_row["order_block"].values[0] != 0
-        has_choch = latest_row["choch_signal"].values[0] != 0
+        # SAFE PROBABILITY EXTRACTION (Fixes TypeError: 'float' object is not subscriptable)
+        proba = model.predict_proba(latest_row)
+        if proba.ndim == 2:
+            confidence = float(proba[0][1])
+        else:
+            confidence = float(proba[1])
+
+        has_fvg = df.iloc[-1]["fvg_signal"] != 0
+        has_ob = df.iloc[-1]["order_block"] != 0
+        has_choch = df.iloc[-1]["choch_signal"] != 0
 
         direction = "BUY" if prediction == 1 else "SELL"
         status = (
@@ -167,9 +174,9 @@ def run_pipeline():
         return {
             "status": status,
             "confidence": f"{confidence * 100:.2f}%",
-            "ob": has_ob,
-            "fvg": has_fvg,
-            "choch": has_choch,
+            "ob": bool(has_ob),
+            "fvg": bool(has_fvg),
+            "choch": bool(has_choch),
             "time": current_utc,
             "error": None,
         }
@@ -181,7 +188,7 @@ def run_pipeline():
             "fvg": False,
             "choch": False,
             "time": current_utc,
-            "error": f"Pipeline execution failed:\n{traceback.format_exc()}",
+            "error": f"Pipeline failure:\n{traceback.format_exc()}",
         }
 
 
