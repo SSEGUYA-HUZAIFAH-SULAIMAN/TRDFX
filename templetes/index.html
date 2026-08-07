@@ -5,24 +5,31 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AI Trading Dashboard</title>
     <style>
-        body { font-family: Arial, sans-serif; background: #121212; color: #fff; text-align: center; padding: 20px; }
-        .card { background: #1e1e1e; border-radius: 10px; padding: 20px; max-width: 400px; margin: 0 auto; box-shadow: 0 4px 10px rgba(0,0,0,0.5); }
-        .buy { color: #00ff88; font-weight: bold; }
-        .wait { color: #ffaa00; font-weight: bold; }
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #121212; color: #fff; text-align: center; padding: 20px; }
+        .card { background: #1e1e1e; border-radius: 12px; padding: 25px; max-width: 420px; margin: 30px auto; box-shadow: 0 8px 20px rgba(0,0,0,0.6); border: 1px solid #2a2a2a; }
+        .buy { color: #00ff88; font-size: 2rem; }
+        .wait { color: #ffaa00; font-size: 2rem; }
+        .error-msg { color: #ff4444; background: #2a1515; padding: 10px; border-radius: 6px; font-size: 0.9rem; margin-top: 15px; }
     </style>
 </head>
 <body>
     <div class="card">
-        <h2>🤖 AI Trading Signal</h2>
+        <h2>🤖 AI Trading Signal Engine</h2>
         <p><strong>Last Updated:</strong> {{ data.time }}</p>
-        <hr>
-        <h1 class="{{ 'buy' if 'GO AHEAD' in data.status else 'wait' }}">{{ data.data_status if data.data_status else data.status }}</h1>
+        <hr style="border-color: #333;">
+        
+        <h1 class="{{ 'buy' if 'GO AHEAD' in data.status else 'wait' }}">{{ data.status }}</h1>
         <p><strong>Model Confidence:</strong> {{ data.confidence }}</p>
-        <hr>
+        
+        {% if data.error %}
+            <div class="error-msg">⚠️ {{ data.error }}</div>
+        {% endif %}
+
+        <hr style="border-color: #333;">
         <h3>SMC Confluences</h3>
-        <p>Order Block: {{ '✅' if data.ob else '❌' }}</p>
-        <p>Fair Value Gap: {{ '✅' if data.fvg else '❌' }}</p>
-        <p>CHOCH Reversal: {{ '✅' if data.choch else '❌' }}</p>
+        <p>Order Block (OB): {{ '✅ Yes' if data.ob else '❌ No' }}</p>
+        <p>Fair Value Gap (FVG): {{ '✅ Yes' if data.fvg else '❌ No' }}</p>
+        <p>CHOCH Reversal: {{ '✅ Yes' if data.choch else '❌ No' }}</p>
     </div>
 </body>
 </html>
