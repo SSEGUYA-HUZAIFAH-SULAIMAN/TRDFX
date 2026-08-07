@@ -9,15 +9,49 @@ import yfinance as yf
 app = Flask(__name__)
 
 
-def analyze_market():
-    # Download EURUSD 15m data using yfinance for cloud compatibility
-    df = yf.download(
-        tickers="EURUSD=X", period="5d", interval="15m", progress=False
-    )
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
+def fetch_forex_data():
+    """Fetches EUR/USD candles with fallback handling to prevent cloud rate-limit crashes."""
+    try:
+        # Use Ticker.history which uses different endpoints less prone to IP blocks
+        ticker = yf.Ticker("EURUSD=X")
+        df = ticker.history(period="5d", interval="15m")
 
-    df.columns = [c.lower() for c in df.columns]
+        if df.empty:
+            # Secondary fallback ticker format
+            df = yf.download(
+                tickers="EURUSD=X", period="5d", interval="15m", progress=False
+            )
+
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+        df.columns = [c.lower() for c in df.columns]
+
+        # Verify minimum required candles
+        if len(df) < 300:
+            return None
+
+        return df
+    except Exception as e:
+        print(f"Data Fetch Error: {e}")
+        return None
+
+
+def analyze_market():
+    df = fetch_forex_data()
+
+    if df is None or len(df) < 300:
+        return {
+            "status": "DATA ERROR",
+            "confidence": "N/A",
+            "ob": False,
+            "fvg": False,
+            "choch": False,
+            "time": datetime.datetime.now(datetime.timezone.utc).strftime(
+                "%Y-%m-%d %H:%M:%S UTC"
+            ),
+            "error": "Market data provider rate-limited. Retrying on next refresh...",
+        }
 
     # SMC Features
     fvg_df = smc.fvg(df)
@@ -51,14 +85,17 @@ def analyze_market():
     X = df[feature_cols]
     df["target"] = (df["close"].shift(-8) > df["close"]).astype(int)
 
-    # Train Model
+    # Train Model Safely
+    train_size = max(50, len(df) - 200)
+    X_train, y_train = X.iloc[:train_size], df["target"].iloc[:train_size]
+
     model = XGBClassifier(
         n_estimators=100,
         learning_rate=0.03,
         max_depth=4,
         eval_metric="logloss",
     )
-    model.fit(X.iloc[:-200], df["target"].iloc[:-200])
+    model.fit(X_train, y_train)
 
     latest_row = df.iloc[[-1]]
     features = latest_row[feature_cols]
@@ -85,6 +122,7 @@ def analyze_market():
         "time": datetime.datetime.now(datetime.timezone.utc).strftime(
             "%Y-%m-%d %H:%M:%S UTC"
         ),
+        "error": None,
     }
 
 
