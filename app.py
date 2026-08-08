@@ -20,6 +20,10 @@ REFRESH_SECONDS = 300          # retrain/refresh every 5 minutes, not every requ
 TICKER = "EURUSD=X"
 INTERVAL = "15m"
 PERIOD = "5d"
+RISK_REWARD_RATIO = 2.0        # take-profit distance = risk distance * this
+SL_BUFFER_PIPS = 0.0005        # small buffer beyond the swing point (5 pips on EURUSD)
+WALK_FORWARD_FOLDS = 4
+FOLD_SIZE = 50                 # each fold ~12.5 hours of M15 candles
 
 # ----------------------------------------------------------------------
 # SHARED STATE (what every web request actually reads — instant, no I/O)
@@ -35,6 +39,10 @@ _state = {
     "time": None,
     "next_candle": "N/A",
     "horizon": "M15 candles, ~2 hour horizon (8 candles ahead)",
+    "entry_price": "N/A",
+    "stop_loss": "N/A",
+    "take_profit": "N/A",
+    "risk_reward": f"1:{RISK_REWARD_RATIO:g}",
     "error": "First data/model refresh is still running. Refresh the page shortly.",
 }
 
@@ -63,7 +71,7 @@ HTML_LAYOUT = """
 
         <h1 class="{{ 'buy' if 'GO AHEAD' in data.status else 'wait' }}">{{ data.status }}</h1>
         <p><strong>Signal Confidence:</strong> <span class="badge">{{ data.confidence }}</span></p>
-        <p><strong>Backtested Accuracy (200 candles):</strong> <span class="badge">{{ data.backtest_accuracy }}</span></p>
+        <p><strong>Backtested Accuracy:</strong> <span class="badge">{{ data.backtest_accuracy }}</span></p>
 
         {% if data.error %}
             <div class="error-box"><strong>Notice:</strong> {{ data.error }}</div>
@@ -74,6 +82,12 @@ HTML_LAYOUT = """
         <p>Order Block (OB): {{ '✅ Present' if data.ob else '❌ None' }}</p>
         <p>Fair Value Gap (FVG): {{ '✅ Present' if data.fvg else '❌ None' }}</p>
         <p>CHOCH Reversal: {{ '✅ Present' if data.choch else '❌ None' }}</p>
+
+        <hr style="border-color: #30363d;">
+        <h3>Trade Plan</h3>
+        <p>Entry (next candle open): <strong>{{ data.entry_price }}</strong></p>
+        <p>Stop Loss (beyond recent swing): <strong style="color:#f85149;">{{ data.stop_loss }}</strong></p>
+        <p>Take Profit ({{ data.risk_reward }} R:R): <strong style="color:#3fb950;">{{ data.take_profit }}</strong></p>
 
         <hr style="border-color: #30363d;">
         <h3>Trade Timing</h3>
@@ -149,11 +163,36 @@ def compute_smc_features(df, max_trim=8):
             ob_df = smc.ob(d, swing_df)
             d["order_block"] = ob_df["OB"]
 
-            return d, None
+            return d, swing_df, None
         except IndexError as e:
             last_err = e
             continue
-    return None, last_err or IndexError("SMC feature computation failed after trimming")
+    return None, None, last_err or IndexError("SMC feature computation failed after trimming")
+
+
+def find_recent_swing_level(swing_df, direction, lookback=30):
+    """
+    Look back through the swing_highs_lows output for the most recent
+    confirmed swing point in the given direction, to anchor a stop-loss.
+    direction: -1 for swing low (used for BUY stop-loss), 1 for swing high
+    (used for SELL stop-loss). Returns the price level, or None if not found.
+    Handles the library's actual column names defensively since exact
+    column naming can vary between versions.
+    """
+    if swing_df is None or swing_df.empty:
+        return None
+
+    # Common column names in smartmoneyconcepts output
+    type_col = "HighLow" if "HighLow" in swing_df.columns else None
+    level_col = "Level" if "Level" in swing_df.columns else None
+    if type_col is None or level_col is None:
+        return None
+
+    recent = swing_df.tail(lookback)
+    matches = recent[recent[type_col] == direction]
+    if matches.empty:
+        return None
+    return float(matches[level_col].iloc[-1])
 
 
 # ----------------------------------------------------------------------
@@ -174,11 +213,15 @@ def run_pipeline():
             "time": current_utc,
             "next_candle": "N/A",
             "horizon": "N/A",
+            "entry_price": "N/A",
+            "stop_loss": "N/A",
+            "take_profit": "N/A",
+            "risk_reward": f"1:{RISK_REWARD_RATIO:g}",
             "error": f"Market data provider issue: {err}",
         }
 
     try:
-        df, smc_err = compute_smc_features(df)
+        df, swing_df, smc_err = compute_smc_features(df)
         if df is None:
             raise smc_err
 
@@ -205,18 +248,52 @@ def run_pipeline():
         # training or backtesting — only for generating today's live signal.
         usable = df.iloc[:-8] if len(df) > 8 else df.iloc[:0]
 
-        BACKTEST_WINDOW = 200
-        if len(usable) > BACKTEST_WINDOW + 20:
-            train_size = len(usable) - BACKTEST_WINDOW
+        BACKTEST_WINDOW = WALK_FORWARD_FOLDS * FOLD_SIZE
+        if len(usable) > BACKTEST_WINDOW + 50:
+            initial_train_size = len(usable) - BACKTEST_WINDOW
+            fold_accuracies = []
+
+            for fold_i in range(WALK_FORWARD_FOLDS):
+                fold_train_end = initial_train_size + fold_i * FOLD_SIZE
+                fold_test_start = fold_train_end
+                fold_test_end = fold_train_end + FOLD_SIZE
+
+                fold_X_train = X.iloc[:fold_train_end]
+                fold_y_train = usable["target"].iloc[:fold_train_end]
+                fold_X_test = X.iloc[fold_test_start:fold_test_end]
+                fold_y_test = usable["target"].iloc[fold_test_start:fold_test_end]
+
+                if len(fold_X_test) == 0:
+                    continue
+
+                fold_model = XGBClassifier(
+                    n_estimators=50,
+                    learning_rate=0.03,
+                    max_depth=3,
+                    eval_metric="logloss",
+                )
+                fold_model.fit(fold_X_train, fold_y_train)
+                fold_preds = fold_model.predict(fold_X_test)
+                fold_accuracies.append(float((fold_preds == fold_y_test.values).mean()))
+
+            train_size = initial_train_size + BACKTEST_WINDOW
             X_train, y_train = X.iloc[:train_size], usable["target"].iloc[:train_size]
-            X_test = X.iloc[train_size: train_size + BACKTEST_WINDOW]
-            y_test = usable["target"].iloc[train_size: train_size + BACKTEST_WINDOW]
+
+            if fold_accuracies:
+                mean_acc = float(np.mean(fold_accuracies))
+                std_acc = float(np.std(fold_accuracies))
+                backtest_accuracy_str = (
+                    f"{mean_acc * 100:.1f}% \u00b1 {std_acc * 100:.1f}% "
+                    f"(walk-forward, {len(fold_accuracies)} folds)"
+                )
+            else:
+                backtest_accuracy_str = "N/A (not enough history yet)"
         else:
-            # Not enough history yet for a clean holdout — train on
-            # everything usable and skip backtesting this cycle.
+            # Not enough history yet for a clean walk-forward split — train
+            # on everything usable and skip backtesting this cycle.
             train_size = len(usable)
             X_train, y_train = X.iloc[:train_size], usable["target"].iloc[:train_size]
-            X_test, y_test = None, None
+            backtest_accuracy_str = "N/A (not enough history yet)"
 
         model = XGBClassifier(
             n_estimators=50,
@@ -225,15 +302,6 @@ def run_pipeline():
             eval_metric="logloss",
         )
         model.fit(X_train, y_train)
-
-        # Backtested accuracy: % of the holdout window where the model's
-        # BUY/SELL call matched what actually happened 8 candles later.
-        if X_test is not None and len(X_test) > 0:
-            test_preds = model.predict(X_test)
-            backtest_accuracy = float((test_preds == y_test.values).mean())
-            backtest_accuracy_str = f"{backtest_accuracy * 100:.2f}%"
-        else:
-            backtest_accuracy_str = "N/A (not enough history yet)"
 
         latest_row = df.iloc[[-1]][feature_cols]
         prediction = model.predict(latest_row)[0]
@@ -251,6 +319,41 @@ def run_pipeline():
             if (confidence >= 0.68 and (has_ob or has_fvg or has_choch))
             else "WAIT / NO TRADE"
         )
+
+        # Trade plan: entry is the next candle's open (unknown yet, so we
+        # use the current close as the best available estimate). Stop-loss
+        # anchors to the most recent opposing swing point (SMC-style), with
+        # a small buffer since price often wicks slightly past a swing
+        # before reversing. Take-profit is derived from the configured
+        # risk:reward ratio, not a separate prediction.
+        entry_estimate = float(df.iloc[-1]["close"])
+
+        if direction == "BUY":
+            swing_level = find_recent_swing_level(swing_df, direction=-1)
+            if swing_level is not None:
+                stop_loss = swing_level - SL_BUFFER_PIPS
+            else:
+                stop_loss = entry_estimate - float(df.iloc[-1]["dist_from_support"]) * entry_estimate - SL_BUFFER_PIPS
+            risk = entry_estimate - stop_loss
+            take_profit = entry_estimate + risk * RISK_REWARD_RATIO
+        else:
+            swing_level = find_recent_swing_level(swing_df, direction=1)
+            if swing_level is not None:
+                stop_loss = swing_level + SL_BUFFER_PIPS
+            else:
+                stop_loss = entry_estimate + float(df.iloc[-1]["dist_from_resistance"]) * entry_estimate + SL_BUFFER_PIPS
+            risk = stop_loss - entry_estimate
+            take_profit = entry_estimate - risk * RISK_REWARD_RATIO
+
+        # Guard against a degenerate/zero risk distance (flat swing data)
+        if risk <= 0 or not np.isfinite(risk):
+            entry_price_str = f"{entry_estimate:.5f}"
+            stop_loss_str = "N/A (no valid swing reference)"
+            take_profit_str = "N/A"
+        else:
+            entry_price_str = f"{entry_estimate:.5f}"
+            stop_loss_str = f"{stop_loss:.5f}"
+            take_profit_str = f"{take_profit:.5f}"
 
         # Entry timing: the candle this signal is based on already closed,
         # so the actionable entry point is the OPEN of the next M15 candle.
@@ -272,6 +375,10 @@ def run_pipeline():
             "time": current_utc,
             "next_candle": next_candle_str,
             "horizon": "Based on M15 candles \u2014 signal targets price movement ~2 hours ahead (8 candles). Not a scalping signal.",
+            "entry_price": entry_price_str,
+            "stop_loss": stop_loss_str,
+            "take_profit": take_profit_str,
+            "risk_reward": f"1:{RISK_REWARD_RATIO:g}",
             "error": None,
         }
     except Exception:
@@ -285,6 +392,10 @@ def run_pipeline():
             "time": current_utc,
             "next_candle": "N/A",
             "horizon": "N/A",
+            "entry_price": "N/A",
+            "stop_loss": "N/A",
+            "take_profit": "N/A",
+            "risk_reward": f"1:{RISK_REWARD_RATIO:g}",
             "error": f"Pipeline failure:\n{traceback.format_exc()}",
         }
 
