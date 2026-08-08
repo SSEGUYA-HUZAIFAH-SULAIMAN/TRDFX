@@ -85,6 +85,37 @@ def fetch_market_data():
         return None, str(e)
 
 
+def compute_smc_features(df, max_trim=8):
+    """
+    The smartmoneyconcepts library can raise IndexError('positional indexers
+    are out-of-bounds') when a swing point lands too close to the end of the
+    dataframe (common with thin/weekend data). Retry on a slightly trimmed
+    copy of df until it succeeds, instead of letting it crash the request.
+    """
+    last_err = None
+    for trim in range(0, max_trim + 1):
+        d = df.iloc[: len(df) - trim].copy() if trim else df.copy()
+        if len(d) < 50:
+            break
+        try:
+            fvg_df = smc.fvg(d)
+            d["fvg_signal"] = fvg_df["FVG"]
+
+            swing_df = smc.swing_highs_lows(d, swing_length=10)
+            bos_choch = smc.bos_choch(d, swing_df)
+            d["bos_signal"] = bos_choch["BOS"]
+            d["choch_signal"] = bos_choch["CHOCH"]
+
+            ob_df = smc.ob(d, swing_df)
+            d["order_block"] = ob_df["OB"]
+
+            return d, None
+        except IndexError as e:
+            last_err = e
+            continue
+    return None, last_err or IndexError("SMC feature computation failed after trimming")
+
+
 def run_pipeline():
     current_utc = datetime.datetime.now(datetime.timezone.utc).strftime(
         "%Y-%m-%d %H:%M:%S UTC"
@@ -103,17 +134,11 @@ def run_pipeline():
         }
 
     try:
-        # 1. Feature Engineering
-        fvg_df = smc.fvg(df)
-        df["fvg_signal"] = fvg_df["FVG"]
-
-        swing_df = smc.swing_highs_lows(df, swing_length=10)
-        bos_choch = smc.bos_choch(df, swing_df)
-        df["bos_signal"] = bos_choch["BOS"]
-        df["choch_signal"] = bos_choch["CHOCH"]
-
-        ob_df = smc.ob(df, swing_df)
-        df["order_block"] = ob_df["OB"]
+        # 1. Feature Engineering (with resilient retry against a known
+        # smartmoneyconcepts boundary bug on thin/weekend data)
+        df, smc_err = compute_smc_features(df)
+        if df is None:
+            raise smc_err
 
         df["support_zone"] = df["low"].rolling(50).min()
         df["resistance_zone"] = df["high"].rolling(50).max()
@@ -194,8 +219,38 @@ def run_pipeline():
 
 @app.route("/")
 def index():
-    data = run_pipeline()
+    try:
+        data = run_pipeline()
+    except Exception:
+        data = {
+            "status": "PROCESSING ERROR",
+            "confidence": "N/A",
+            "ob": False,
+            "fvg": False,
+            "choch": False,
+            "time": datetime.datetime.now(datetime.timezone.utc).strftime(
+                "%Y-%m-%d %H:%M:%S UTC"
+            ),
+            "error": f"Unhandled pipeline failure:\n{traceback.format_exc()}",
+        }
     return render_template_string(HTML_LAYOUT, data=data)
+
+
+@app.errorhandler(Exception)
+def handle_any_error(e):
+    # Last line of defense: never let a raw 500 page reach the browser.
+    data = {
+        "status": "SERVICE ERROR",
+        "confidence": "N/A",
+        "ob": False,
+        "fvg": False,
+        "choch": False,
+        "time": datetime.datetime.now(datetime.timezone.utc).strftime(
+            "%Y-%m-%d %H:%M:%S UTC"
+        ),
+        "error": f"{type(e).__name__}: {e}",
+    }
+    return render_template_string(HTML_LAYOUT, data=data), 200
 
 
 if __name__ == "__main__":
