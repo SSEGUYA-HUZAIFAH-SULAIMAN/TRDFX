@@ -28,10 +28,13 @@ _state_lock = threading.Lock()
 _state = {
     "status": "WARMING UP",
     "confidence": "N/A",
+    "backtest_accuracy": "N/A",
     "ob": False,
     "fvg": False,
     "choch": False,
     "time": None,
+    "next_candle": "N/A",
+    "horizon": "M15 candles, ~2 hour horizon (8 candles ahead)",
     "error": "First data/model refresh is still running. Refresh the page shortly.",
 }
 
@@ -59,7 +62,8 @@ HTML_LAYOUT = """
         <hr style="border-color: #30363d;">
 
         <h1 class="{{ 'buy' if 'GO AHEAD' in data.status else 'wait' }}">{{ data.status }}</h1>
-        <p><strong>Model Confidence:</strong> <span class="badge">{{ data.confidence }}</span></p>
+        <p><strong>Signal Confidence:</strong> <span class="badge">{{ data.confidence }}</span></p>
+        <p><strong>Backtested Accuracy (200 candles):</strong> <span class="badge">{{ data.backtest_accuracy }}</span></p>
 
         {% if data.error %}
             <div class="error-box"><strong>Notice:</strong> {{ data.error }}</div>
@@ -70,6 +74,11 @@ HTML_LAYOUT = """
         <p>Order Block (OB): {{ '✅ Present' if data.ob else '❌ None' }}</p>
         <p>Fair Value Gap (FVG): {{ '✅ Present' if data.fvg else '❌ None' }}</p>
         <p>CHOCH Reversal: {{ '✅ Present' if data.choch else '❌ None' }}</p>
+
+        <hr style="border-color: #30363d;">
+        <h3>Trade Timing</h3>
+        <p>Next M15 candle open (UTC): <strong>{{ data.next_candle }}</strong></p>
+        <p>{{ data.horizon }}</p>
 
         <p class="stale">Refreshed automatically every {{ refresh_seconds }}s in the background.</p>
     </div>
@@ -158,10 +167,13 @@ def run_pipeline():
         return {
             "status": "DATA PAUSED",
             "confidence": "N/A",
+            "backtest_accuracy": "N/A",
             "ob": False,
             "fvg": False,
             "choch": False,
             "time": current_utc,
+            "next_candle": "N/A",
+            "horizon": "N/A",
             "error": f"Market data provider issue: {err}",
         }
 
@@ -188,8 +200,23 @@ def run_pipeline():
         X = df[feature_cols]
         df["target"] = (df["close"].shift(-8) > df["close"]).astype(int)
 
-        train_size = max(10, len(df) - 50)
-        X_train, y_train = X.iloc[:train_size], df["target"].iloc[:train_size]
+        # Drop the last 8 rows: their target is unknown (shift(-8) looks into
+        # the future that hasn't happened yet), so they can't be used for
+        # training or backtesting — only for generating today's live signal.
+        usable = df.iloc[:-8] if len(df) > 8 else df.iloc[:0]
+
+        BACKTEST_WINDOW = 200
+        if len(usable) > BACKTEST_WINDOW + 20:
+            train_size = len(usable) - BACKTEST_WINDOW
+            X_train, y_train = X.iloc[:train_size], usable["target"].iloc[:train_size]
+            X_test = X.iloc[train_size: train_size + BACKTEST_WINDOW]
+            y_test = usable["target"].iloc[train_size: train_size + BACKTEST_WINDOW]
+        else:
+            # Not enough history yet for a clean holdout — train on
+            # everything usable and skip backtesting this cycle.
+            train_size = len(usable)
+            X_train, y_train = X.iloc[:train_size], usable["target"].iloc[:train_size]
+            X_test, y_test = None, None
 
         model = XGBClassifier(
             n_estimators=50,
@@ -198,6 +225,15 @@ def run_pipeline():
             eval_metric="logloss",
         )
         model.fit(X_train, y_train)
+
+        # Backtested accuracy: % of the holdout window where the model's
+        # BUY/SELL call matched what actually happened 8 candles later.
+        if X_test is not None and len(X_test) > 0:
+            test_preds = model.predict(X_test)
+            backtest_accuracy = float((test_preds == y_test.values).mean())
+            backtest_accuracy_str = f"{backtest_accuracy * 100:.2f}%"
+        else:
+            backtest_accuracy_str = "N/A (not enough history yet)"
 
         latest_row = df.iloc[[-1]][feature_cols]
         prediction = model.predict(latest_row)[0]
@@ -216,23 +252,39 @@ def run_pipeline():
             else "WAIT / NO TRADE"
         )
 
+        # Entry timing: the candle this signal is based on already closed,
+        # so the actionable entry point is the OPEN of the next M15 candle.
+        last_candle_time = df.index[-1]
+        if last_candle_time.tzinfo is None:
+            last_candle_time = last_candle_time.tz_localize("UTC")
+        else:
+            last_candle_time = last_candle_time.tz_convert("UTC")
+        next_candle_time = last_candle_time + pd.Timedelta(minutes=15)
+        next_candle_str = next_candle_time.strftime("%Y-%m-%d %H:%M UTC")
+
         return {
             "status": status,
             "confidence": f"{confidence * 100:.2f}%",
+            "backtest_accuracy": backtest_accuracy_str,
             "ob": bool(has_ob),
             "fvg": bool(has_fvg),
             "choch": bool(has_choch),
             "time": current_utc,
+            "next_candle": next_candle_str,
+            "horizon": "Based on M15 candles \u2014 signal targets price movement ~2 hours ahead (8 candles). Not a scalping signal.",
             "error": None,
         }
     except Exception:
         return {
             "status": "PROCESSING ERROR",
             "confidence": "N/A",
+            "backtest_accuracy": "N/A",
             "ob": False,
             "fvg": False,
             "choch": False,
             "time": current_utc,
+            "next_candle": "N/A",
+            "horizon": "N/A",
             "error": f"Pipeline failure:\n{traceback.format_exc()}",
         }
 
