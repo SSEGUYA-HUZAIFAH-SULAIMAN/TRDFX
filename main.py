@@ -10,7 +10,7 @@ from xgboost import XGBClassifier
 # CONFIGURATION & CREDENTIALS
 # ==========================================
 ACCOUNT_ID = 5481848
-PASSWORD = "Sseguya@023%"  
+PASSWORD = "Sseggg"  
 SERVER = "Headway-Demo"
 SYMBOL = "EURUSD"
 CHECK_INTERVAL_SECONDS = 900  # 15 minutes (900 seconds)
