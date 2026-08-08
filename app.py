@@ -25,6 +25,12 @@ SL_BUFFER_PIPS = 0.0005        # small buffer beyond the swing point (5 pips on 
 WALK_FORWARD_FOLDS = 4
 FOLD_SIZE = 50                 # each fold ~12.5 hours of M15 candles
 
+# Higher-timeframe trend filter
+TREND_INTERVAL = "1h"
+TREND_PERIOD = "90d"
+TREND_FAST_EMA = 50
+TREND_SLOW_EMA = 200
+
 # ----------------------------------------------------------------------
 # SHARED STATE (what every web request actually reads — instant, no I/O)
 # ----------------------------------------------------------------------
@@ -43,6 +49,7 @@ _state = {
     "stop_loss": "N/A",
     "take_profit": "N/A",
     "risk_reward": f"1:{RISK_REWARD_RATIO:g}",
+    "htf_trend": "N/A",
     "error": "First data/model refresh is still running. Refresh the page shortly.",
 }
 
@@ -82,6 +89,7 @@ HTML_LAYOUT = """
         <p>Order Block (OB): {{ '✅ Present' if data.ob else '❌ None' }}</p>
         <p>Fair Value Gap (FVG): {{ '✅ Present' if data.fvg else '❌ None' }}</p>
         <p>CHOCH Reversal: {{ '✅ Present' if data.choch else '❌ None' }}</p>
+        <p>H1 Trend Filter: <strong>{{ data.htf_trend }}</strong></p>
 
         <hr style="border-color: #30363d;">
         <h3>Trade Plan</h3>
@@ -104,7 +112,7 @@ HTML_LAYOUT = """
 # ----------------------------------------------------------------------
 # DATA
 # ----------------------------------------------------------------------
-def fetch_market_data():
+def fetch_market_data(interval=INTERVAL, period=PERIOD):
     try:
         session = requests.Session()
         session.headers.update(
@@ -115,13 +123,13 @@ def fetch_market_data():
         )
 
         ticker = yf.Ticker(TICKER, session=session)
-        df = ticker.history(period=PERIOD, interval=INTERVAL)
+        df = ticker.history(period=period, interval=interval)
 
         if df.empty:
             df = yf.download(
                 tickers=TICKER,
-                period=PERIOD,
-                interval=INTERVAL,
+                period=period,
+                interval=interval,
                 progress=False,
                 ignore_tz=True,
             )
@@ -137,6 +145,32 @@ def fetch_market_data():
         return df, None
     except Exception as e:
         return None, str(e)
+
+
+def determine_htf_trend(trend_df):
+    """
+    Simple, transparent higher-timeframe trend filter using EMA50 vs EMA200
+    on H1 candles: price above both EMAs with EMA50 above EMA200 = uptrend;
+    the mirror image = downtrend; anything else = neutral/no clear trend.
+    Returns (trend_str, direction) where direction is 'BUY', 'SELL', or None.
+    """
+    if trend_df is None or len(trend_df) < TREND_SLOW_EMA + 5:
+        return "Unavailable (insufficient H1 history)", None
+
+    closes = trend_df["close"]
+    ema_fast = closes.ewm(span=TREND_FAST_EMA, adjust=False).mean()
+    ema_slow = closes.ewm(span=TREND_SLOW_EMA, adjust=False).mean()
+
+    last_close = float(closes.iloc[-1])
+    last_fast = float(ema_fast.iloc[-1])
+    last_slow = float(ema_slow.iloc[-1])
+
+    if last_close > last_fast > last_slow:
+        return f"UPTREND (H1, EMA{TREND_FAST_EMA}>EMA{TREND_SLOW_EMA})", "BUY"
+    elif last_close < last_fast < last_slow:
+        return f"DOWNTREND (H1, EMA{TREND_FAST_EMA}<EMA{TREND_SLOW_EMA})", "SELL"
+    else:
+        return "RANGING / NO CLEAR TREND (H1)", None
 
 
 def compute_smc_features(df, max_trim=8):
@@ -200,7 +234,13 @@ def find_recent_swing_level(swing_df, direction, lookback=30):
 # ----------------------------------------------------------------------
 def run_pipeline():
     current_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    df, err = fetch_market_data()
+    df, err = fetch_market_data(interval=INTERVAL, period=PERIOD)
+
+    # Higher-timeframe trend is fetched independently. If it fails, we don't
+    # block the whole pipeline — we just fall back to no trend filtering
+    # (documented clearly in the UI) rather than crashing the signal.
+    trend_df, trend_err = fetch_market_data(interval=TREND_INTERVAL, period=TREND_PERIOD)
+    htf_trend_label, htf_trend_direction = determine_htf_trend(trend_df if not trend_err else None)
 
     if err or df is None:
         return {
@@ -217,6 +257,7 @@ def run_pipeline():
             "stop_loss": "N/A",
             "take_profit": "N/A",
             "risk_reward": f"1:{RISK_REWARD_RATIO:g}",
+            "htf_trend": htf_trend_label,
             "error": f"Market data provider issue: {err}",
         }
 
@@ -314,11 +355,16 @@ def run_pipeline():
         has_choch = df.iloc[-1]["choch_signal"] != 0
 
         direction = "BUY" if prediction == 1 else "SELL"
-        status = (
-            f"GO AHEAD: {direction}"
-            if (confidence >= 0.68 and (has_ob or has_fvg or has_choch))
-            else "WAIT / NO TRADE"
-        )
+
+        base_signal_ok = confidence >= 0.68 and (has_ob or has_fvg or has_choch)
+        trend_aligned = (htf_trend_direction is None) or (htf_trend_direction == direction)
+
+        if base_signal_ok and trend_aligned:
+            status = f"GO AHEAD: {direction}"
+        elif base_signal_ok and not trend_aligned:
+            status = f"WAIT / NO TRADE (counter-trend: model says {direction}, H1 trend disagrees)"
+        else:
+            status = "WAIT / NO TRADE"
 
         # Trade plan: entry is the next candle's open (unknown yet, so we
         # use the current close as the best available estimate). Stop-loss
@@ -379,6 +425,7 @@ def run_pipeline():
             "stop_loss": stop_loss_str,
             "take_profit": take_profit_str,
             "risk_reward": f"1:{RISK_REWARD_RATIO:g}",
+            "htf_trend": htf_trend_label,
             "error": None,
         }
     except Exception:
@@ -396,6 +443,7 @@ def run_pipeline():
             "stop_loss": "N/A",
             "take_profit": "N/A",
             "risk_reward": f"1:{RISK_REWARD_RATIO:g}",
+            "htf_trend": "N/A",
             "error": f"Pipeline failure:\n{traceback.format_exc()}",
         }
 
